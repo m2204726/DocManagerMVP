@@ -6,14 +6,11 @@ from datetime import datetime
 import uuid
 
 # --- НАСТРОЙКА БАЗЫ ДАННЫХ ---
-# Если есть переменная DATABASE_URL (как на Railway), используем PostgreSQL, иначе SQLite
 DB_URL = os.getenv("DATABASE_URL")
 if DB_URL and DB_URL.startswith("postgres"):
     import psycopg2
     def get_db():
         return psycopg2.connect(DB_URL)
-    def dict_cursor(conn):
-        return conn.cursor() # Упрощено для MVP
 else:
     def get_db():
         conn = sqlite3.connect("local_db.sqlite", check_same_thread=False)
@@ -23,32 +20,26 @@ else:
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
-    # Таблица пользователей
     cursor.execute('''CREATE TABLE IF NOT EXISTS users 
                       (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT)''')
-    # Таблица проектов
     cursor.execute('''CREATE TABLE IF NOT EXISTS projects 
                       (id INTEGER PRIMARY KEY, name TEXT UNIQUE)''')
-    # Таблица документов (метаданные)
     cursor.execute('''CREATE TABLE IF NOT EXISTS documents 
                       (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, tags TEXT, 
                        created_by TEXT, created_at TEXT)''')
-    # Таблица версий файлов
     cursor.execute('''CREATE TABLE IF NOT EXISTS versions 
                       (id INTEGER PRIMARY KEY, document_id INTEGER, version_num INTEGER, 
                        file_path TEXT, uploaded_by TEXT, uploaded_at TEXT)''')
     
-    # Создаем тестового пользователя и проект, если их нет
     cursor.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES ('admin', '1234', 'admin')")
     cursor.execute("INSERT OR IGNORE INTO projects (name) VALUES ('Общий проект')")
     conn.commit()
     conn.close()
 
-# Создаем папку для файлов, если её нет
 os.makedirs("uploads", exist_ok=True)
 init_db()
 
-# --- УПРАВЛЕНИЕ СЕССИЕЙ И ВХОД ---
+# --- УПРАВЛЕНИЕ СЕССИЕЙ ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
@@ -80,7 +71,7 @@ def main():
 
     st.title("📁 Централизованное хранилище документов")
 
-    # 1. ЗАГРУЗКА ДОКУМЕНТА
+    # 1. ЗАГРУЗКА
     st.header("Загрузить новый документ или версию")
     with st.form("upload_form"):
         col1, col2 = st.columns(2)
@@ -96,11 +87,9 @@ def main():
         if submitted and uploaded_file is not None and doc_name:
             conn = get_db()
             cursor = conn.cursor()
-            # Проверяем, есть ли уже такой документ в этом проекте
             cursor.execute("SELECT id FROM documents WHERE name=? AND project_id=(SELECT id FROM projects WHERE name=?)", (doc_name, project))
             doc = cursor.fetchone()
             
-            # Сохраняем файл с уникальным именем
             file_ext = uploaded_file.name.split('.')[-1]
             unique_filename = f"{uuid.uuid4().hex}.{file_ext}"
             file_path = os.path.join("uploads", unique_filename)
@@ -108,7 +97,6 @@ def main():
                 f.write(uploaded_file.getbuffer())
             
             if doc:
-                # Новая версия
                 doc_id = doc['id'] if isinstance(doc, dict) else doc[0]
                 cursor.execute("SELECT MAX(version_num) FROM versions WHERE document_id=?", (doc_id,))
                 res = cursor.fetchone()
@@ -118,7 +106,6 @@ def main():
                                (doc_id, new_ver, file_path, st.session_state.username, datetime.now().isoformat()))
                 st.success(f"Добавлена версия {new_ver} для документа '{doc_name}'")
             else:
-                # Новый документ
                 cursor.execute("INSERT INTO documents (project_id, name, tags, created_by, created_at) VALUES ((SELECT id FROM projects WHERE name=?), ?, ?, ?, ?)",
                                (project, doc_name, tags, st.session_state.username, datetime.now().isoformat()))
                 doc_id = cursor.lastrowid
@@ -131,7 +118,7 @@ def main():
 
     st.divider()
 
-    # 2. ПОИСК И ФИЛЬТРАЦИЯ
+    # 2. ПОИСК И КАТАЛОГ
     st.header("Поиск и каталог документов")
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -141,11 +128,10 @@ def main():
     with col3:
         filter_tag = st.text_input("Фильтр по тегу")
 
-    # Формируем SQL-запрос с фильтрами
     query = """
         SELECT d.name as 'Название', p.name as 'Проект', d.tags as 'Теги', 
                MAX(v.version_num) as 'Версия', d.created_by as 'Автор', 
-               MAX(v.uploaded_at) as 'Последнее обновление', v.file_path
+               MAX(v.uploaded_at) as 'Последнее обновление'
         FROM documents d
         JOIN projects p ON d.project_id = p.id
         JOIN versions v ON d.id = v.document_id
@@ -160,49 +146,77 @@ def main():
     
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    
     query += " GROUP BY d.id ORDER BY MAX(v.uploaded_at) DESC"
 
     conn = get_db()
     try:
         df = pd.read_sql_query(query, conn)
-        conn.close()
-        
-        # Отображение таблицы
         st.dataframe(df, use_container_width=True)
 
-        # 3. СКАЧИВАНИЕ И ИСТОРИЯ ВЕРСИЙ
-        st.subheader("Действия с документом")
-        selected_doc = st.selectbox("Выберите документ для скачивания или просмотра истории", df['Название'].tolist() if not df.empty else ["Нет документов"])
-        
-        if selected_doc != "Нет документов":
+        # 3. ДЕЙСТВИЯ С ДОКУМЕНТОМ
+        if not df.empty:
+            st.subheader("Действия с документом")
+            selected_doc = st.selectbox("Выберите документ", df['Название'].tolist())
+            
             conn = get_db()
-            # Получаем ID документа
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM documents WHERE name=?", (selected_doc,))
             doc_id = cursor.fetchone()[0]
             
-            # Получаем все версии
-            cursor.execute("SELECT version_num, file_path, uploaded_by, uploaded_at FROM versions WHERE document_id=? ORDER BY version_num DESC", (doc_id,))
+            # Получаем версии (добавили id версии для возможного удаления в будущем)
+            cursor.execute("SELECT id, version_num, file_path, uploaded_by, uploaded_at FROM versions WHERE document_id=? ORDER BY version_num DESC", (doc_id,))
             versions = cursor.fetchall()
             conn.close()
 
             st.write(f"**История версий для '{selected_doc}':**")
             for ver in versions:
-                ver_num = ver[0] if isinstance(ver, tuple) else ver['version_num']
-                f_path = ver[1] if isinstance(ver, tuple) else ver['file_path']
-                author = ver[2] if isinstance(ver, tuple) else ver['uploaded_by']
-                date = ver[3] if isinstance(ver, tuple) else ver['uploaded_at']
+                ver_id = ver[0] if isinstance(ver, tuple) else ver['id']
+                ver_num = ver[1] if isinstance(ver, tuple) else ver['version_num']
+                f_path = ver[2] if isinstance(ver, tuple) else ver['file_path']
+                author = ver[3] if isinstance(ver, tuple) else ver['uploaded_by']
+                date = ver[4] if isinstance(ver, tuple) else ver['uploaded_at']
                 
-                # Читаем файл для кнопки скачивания
                 with open(f_path, "rb") as file:
                     file_bytes = file.read()
-                st.download_button(
-                    label=f"⬇️ Скачать Версию {ver_num} (от {date[:10]}, автор: {author})",
-                    data=file_bytes,
-                    file_name=f"{selected_doc}_v{ver_num}.{f_path.split('.')[-1]}",
-                    mime="application/octet-stream"
-                )
+                
+                col_dl, col_sp = st.columns([4, 1])
+                with col_dl:
+                    st.download_button(
+                        label=f"⬇️ Скачать Версию {ver_num} (от {date[:10]}, автор: {author})",
+                        data=file_bytes,
+                        file_name=f"{selected_doc}_v{ver_num}.{f_path.split('.')[-1]}",
+                        mime="application/octet-stream",
+                        key=f"dl_{ver_id}"
+                    )
+
+            # 4. ФУНКЦИЯ УДАЛЕНИЯ (НОВОЕ)
+            st.divider()
+            st.subheader("⚠️ Управление документам")
+            st.warning("Удаление документа удалит его из списка и безвозвратно удалит все связанные файлы с сервера.")
+            
+            doc_to_delete = st.selectbox("Выберите документ для полного удаления", df['Название'].tolist(), key="delete_select")
+            
+            if st.button(f"🗑️ Удалить документ '{doc_to_delete}' и все его версии", type="primary"):
+                conn = get_db()
+                cursor = conn.cursor()
+                
+                # 1. Находим все файлы и удаляем их физически
+                cursor.execute("SELECT file_path FROM versions WHERE document_id=(SELECT id FROM documents WHERE name=?)", (doc_to_delete,))
+                files = cursor.fetchall()
+                for f in files:
+                    f_path = f[0] if isinstance(f, tuple) else f['file_path']
+                    if os.path.exists(f_path):
+                        os.remove(f_path)
+                
+                # 2. Удаляем записи из базы данных
+                cursor.execute("DELETE FROM versions WHERE document_id=(SELECT id FROM documents WHERE name=?)", (doc_to_delete,))
+                cursor.execute("DELETE FROM documents WHERE name=?", (doc_to_delete,))
+                conn.commit()
+                conn.close()
+                
+                st.success(f"✅ Документ '{doc_to_delete}' и все его файлы успешно удалены!")
+                st.rerun() # Перезагружаем страницу, чтобы список обновился
+                
     except Exception as e:
         st.error(f"Ошибка чтения данных: {e}")
 
