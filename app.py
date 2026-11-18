@@ -69,7 +69,7 @@ def main():
         st.session_state.logged_in = False
         st.rerun()
 
-    st.title("📁 Централизованное хранилище документов")
+    st.title("📁 Хранилище документов")
 
     # 1. ЗАГРУЗКА
     st.header("Загрузить новый документ или версию")
@@ -81,7 +81,7 @@ def main():
             tags = st.text_input("Теги (через запятую)", "отчет, 2024")
         with col2:
             uploaded_file = st.file_uploader("Выберите файл", type=['pdf', 'docx', 'xlsx', 'txt', 'png'])
-            description = st.text_area("Описание изменений (для новой версии)")
+            description = st.text_area("Описание изменений")
         
         submitted = st.form_submit_button("Загрузить")
         if submitted and uploaded_file is not None and doc_name:
